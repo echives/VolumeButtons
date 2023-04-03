@@ -7,6 +7,7 @@
 import AVFoundation
 import Foundation
 import MediaPlayer
+import RxSwift
 
 /// Class for handle clicks on hardware volume buttons.
 ///
@@ -14,201 +15,184 @@ import MediaPlayer
 /// the value will be reset to the initial one, thus pressing the buttons is determined without changing
 /// the volume of the media player.
 public final class VolumeButtonHandler: NSObject {
-    
+
     // MARK: - Types
-    
-    private enum Constants {
-        static let maxVolume: Float = 0.99
-        static let minVolume: Float = 0.01
-    }
-    
-    /// Which button is pressed
-    public enum Button {
-        /// Up or increase the volume
-        case up
-        /// Down or decrease the volume
-        case down
-    }
-    
-    public typealias ButtonHandler = (Button) -> Void
-    
-    
+
+    public typealias ButtonHandler = () -> Void
+
     // MARK: - Public properties
-    
+
     /// The closure for handle the button clicks
     public var buttonClosure: ButtonHandler?
-    
+
+    /// Preconditions
+    public var checkPreconditions: (() -> Bool)?
+
     /// This flag indicates whether audio session observation is running.
     public private(set) var isStarted: Bool = false
-    
-    
+
     // MARK: - Private properties
-    
+
+    /// avoid Rx cycle caused by setInitialVolume
+    private var isProcessing: Bool = false
     private var appIsActive: Bool = true
-    private var initialVolume: Float = 0
     private var session: AVAudioSession?
     private var sessionCategory: AVAudioSession.Category = .playback
     private var sessionOptions: AVAudioSession.CategoryOptions = .mixWithOthers
-    private var sessionObservation: NSKeyValueObservation?
     private var volumeView: MPVolumeView
-    
-    
+    private var notificationSequenceNumbers = Set<Int>()
+    private var lockVolume: Float = 0
+    private var bag = DisposeBag()
+
     // MARK: - Init
-    
+
     /// - Parameters:
     ///   - containerView: The UIView for placing hidden MPVolumeView instance
     ///   - buttonClosure: The closure for handle button clicks
     public init(containerView: UIView, buttonClosure: ButtonHandler? = nil) {
         self.buttonClosure = buttonClosure
-        self.volumeView = MPVolumeView(frame: CGRect(x: -100, y: -100, width: 0, height: 0))
+        self.volumeView = MPVolumeView(frame: CGRect(x: -200, y: -200, width: 0, height: 0))
         super.init()
         containerView.addSubview(volumeView)
         containerView.sendSubviewToBack(volumeView)
         volumeView.alpha = 0.01
     }
-    
+
     deinit {
         stop()
         volumeView.removeFromSuperview()
     }
-    
-    
+
     // MARK: - Public methods
-    
+
     /// Start volume button handling
     public func start() {
         setupSession()
     }
-    
+
     /// Stop volume button handling
     public func stop() {
         guard isStarted else { return }
-        sessionObservation = nil
+        bag = DisposeBag()
         try? session?.setActive(false)
         session = nil
-        NotificationCenter.default.removeObserver(self)
         isStarted = false
     }
-    
-    
-    // MARK: - Private methods
 
+    // MARK: - Private methods
     func setupSession() {
         guard !isStarted else { return }
         isStarted = true
 
-        session = AVAudioSession.sharedInstance()
+        let session = AVAudioSession.sharedInstance()
         // this must be done before calling setCategory or else the initial volume is reset
+        lockVolume = session.outputVolume
         setInitialVolume()
         do {
-            try session?.setCategory(sessionCategory, options: sessionOptions)
-            try session?.setActive(true)
+            try session.setCategory(sessionCategory, options: sessionOptions)
+            try session.setActive(true)
         } catch {
-            logEvent("Can't start audio session\n\(error)", .audioSession)
             return
         }
 
-        // Observe outputVolume
-        sessionObservation = session?.observe(
-            \.outputVolume,
-            options: [.old, .new],
-            changeHandler: { [weak self] (session, change) in
-                self?.handleVolumeChange(change)
-            }
-        )
-        
         // Audio session is interrupted when you send the app to the background,
         // and needs to be set to active again when it goes to app goes back to the foreground
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(audioSessionInterrupted(_:)),
-            name: AVAudioSession.interruptionNotification,
-            object: nil)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(applicationDidChangeActive(_:)),
-            name:
-            UIApplication.willResignActiveNotification,
-            object: nil)
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(applicationDidChangeActive(_:)),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil)
+
+        Observable.merge(
+            NotificationCenter.default.rx.notification(UIApplication.willResignActiveNotification),
+            NotificationCenter.default.rx.notification(UIApplication.didBecomeActiveNotification)
+        )
+            .subscribe(onNext: { [weak self] notification in
+                self?.appIsActive = (notification.name == UIApplication.didBecomeActiveNotification)
+            })
+            .disposed(by: bag)
+
+        NotificationCenter.default.rx.notification(AVAudioSession.interruptionNotification)
+            .subscribe(onNext: { [weak self] notification in
+                guard
+                    let interuptionDict = notification.userInfo,
+                    let rawInteruptionType = interuptionDict[AVAudioSessionInterruptionTypeKey] as? UInt,
+                    let interuptionType = AVAudioSession.InterruptionType(rawValue: rawInteruptionType)
+                else {
+                    return
+                }
+                switch interuptionType {
+                case .ended:
+                    try? self?.session?.setActive(true)
+                default:
+                    break
+                }
+            })
+            .disposed(by: bag)
+
+        // Volume Observe
+        if #available(iOS 15, *) {
+            NotificationCenter.default.rx.notification(NSNotification.Name(rawValue: "SystemVolumeDidChange"))
+                .observeOn(MainScheduler.asyncInstance)
+                .filter({ [weak self] _ in
+                    guard let self = self else { return false }
+                    return !self.isProcessing && self.isStarted && self.appIsActive
+                })
+                .subscribe(onNext: { [weak self] notification in
+                    guard
+                        let self = self,
+                        self.checkPreconditions?() ?? true
+                    else { return }
+                    // check notification reason
+                    guard
+                        let volumeChangeType = notification.userInfo?["Reason"] as? String,
+                        volumeChangeType == "ExplicitVolumeChange",
+                        let sequenceNumber = notification.userInfo?["SequenceNumber"] as? Int
+                    else { return }
+                    if !self.notificationSequenceNumbers.contains(sequenceNumber) {
+                        self.notificationSequenceNumbers.insert(sequenceNumber)
+                        self.isProcessing = true
+                        self.buttonClosure?()
+                        self.setInitialVolume()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            self.isProcessing = false
+                        }
+                    }
+                })
+                .disposed(by: bag)
+        } else {
+            NotificationCenter.default.rx.notification(NSNotification.Name(rawValue: "AVSystemController_SystemVolumeDidChangeNotification"))
+                .observeOn(MainScheduler.asyncInstance)
+                .filter({ [weak self] _ in
+                    guard let self = self else { return false }
+                    return !self.isProcessing && self.isStarted && self.appIsActive
+                })
+                .subscribe(onNext: { [weak self] notification in
+                    guard
+                        let self = self,
+                        self.checkPreconditions?() ?? true
+                    else { return }
+                    // check notification reason
+                    guard
+                        let volumeChangeType = notification.userInfo?["AVSystemController_AudioVolumeChangeReasonNotificationParameter"] as? String,
+                        volumeChangeType == "ExplicitVolumeChange"
+                    else { return }
+                    self.isProcessing = true
+                    self.buttonClosure?()
+                    self.setInitialVolume()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.isProcessing = false
+                    }
+                })
+                .disposed(by: bag)
+        }
+
+        self.session = session
     }
 
     private func setInitialVolume() {
         guard let session = session else { return }
-        initialVolume = session.outputVolume
-        logEvent("Initial volume \(initialVolume)", .audioSession)
-        if initialVolume > Constants.maxVolume {
-            initialVolume = Constants.maxVolume
-            setSystemVolume(initialVolume)
-        } else if initialVolume < Constants.minVolume {
-            initialVolume = Constants.minVolume
-            setSystemVolume(initialVolume)
-        }
-    }
-    
-    @objc
-    private func audioSessionInterrupted(_ notification: Notification?) {
-        guard
-            let interuptionDict = notification?.userInfo,
-            let rawInteruptionType = interuptionDict[AVAudioSessionInterruptionTypeKey] as? UInt,
-            let interuptionType = AVAudioSession.InterruptionType(rawValue: rawInteruptionType)
-        else {
-            return
-        }
-        switch interuptionType {
-        case .began:
-            logEvent("Audio Session Interruption case started.", .audioSession)
-        case .ended:
-            logEvent("Audio Session Interruption case ended.", .audioSession)
-            try? session?.setActive(true)
-        default:
-            logEvent("Audio Session Interruption Notification case default.", .audioSession)
-        }
-    }
-    
-    @objc
-    private func applicationDidChangeActive(_ notification: Notification?) {
-        guard let ntfName = notification?.name else { return }
-        appIsActive = ntfName == UIApplication.didBecomeActiveNotification
-        if appIsActive && isStarted {
-            setInitialVolume()
-        }
-    }
-    
-    private func setSystemVolume(_ volume: Float) {
-        //find the volumeSlider
-        let volumeViewSlider = volumeView.subviews.first { $0 is UISlider } as? UISlider
-        DispatchQueue.main.asyncAfter(deadline: DispatchTime.now() + 0.01) {
-          volumeViewSlider?.value = volume
-        }
+        setSystemVolume(lockVolume)
     }
 
-    private func handleVolumeChange(_ change: NSKeyValueObservedChange<Float>) {
-        guard self.appIsActive else { return }
-        let oldVolume = change.oldValue ?? 0
-        let newVolume = change.newValue ?? 0
-        
-        if newVolume == initialVolume {
-            // Resetting volume, skip blocks
-            return
-        }
-        
-        let difference = fabsf(newVolume - oldVolume)
-        logEvent("Old vol: \(oldVolume), new vol: \(newVolume), diff: \(difference)", .audioSession)
-        
-        if newVolume > oldVolume {
-            // Up
-            buttonClosure?(.up)
-        } else {
-            // Down
-            buttonClosure?(.down)
-        }
-        
-        // Reset volume to initial value
-        setSystemVolume(initialVolume)
+    private func setSystemVolume(_ volume: Float) {
+        // find the volumeSlider
+        let volumeViewSlider = volumeView.subviews.first { $0 is UISlider } as? UISlider
+        volumeViewSlider?.value = volume
     }
 }

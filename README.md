@@ -1,19 +1,21 @@
 # VolumeButtons
 
-[![Version](https://img.shields.io/cocoapods/v/VolumeButtons.svg?style=flat)](https://cocoapods.org/pods/VolumeButtons)
-[![License](https://img.shields.io/cocoapods/l/VolumeButtons.svg?style=flat)](https://cocoapods.org/pods/VolumeButtons)
-[![Platform](https://img.shields.io/cocoapods/p/VolumeButtons.svg?style=flat)](https://cocoapods.org/pods/VolumeButtons)
-
 VolumeButtons is simple way to handling clicks on hardware volume buttons on iPhone or iPad. 
 
 ## Usage
 
 ```swift
-self.volumeButtonHandler = VolumeButtonHandler(containerView: view)
-volumeButtonHandler.buttonClosure = { button in
-    // ...
+volumeButtonHandler = VolumeButtonHandler(containerView: contentView)
+// custom precondition logic, for example ensure ViewController is top and visible
+volumeButtonHandler?.checkPreconditions = { [weak self] in
+	guard let self = self else { return false }
+	let isTopNavigation = (self.navigationController?.topViewController == self)
+	let isTopPresent = (self.presentedViewController == nil)
+	return isTopNavigation && isTopPresent && self.isVisiable
 }
-volumeButtonHandler.start()
+volumeButtonHandler?.buttonClosure = { [weak self] in
+	self?.takePhoto()
+}
 ```
 
 ## How it works
@@ -22,17 +24,9 @@ VolumeButtonHandler class keeps track of volume changes in an audio session. Whe
 
 ## Requirements
 
-iOS 11 and newer.
-
-## Installation
-
-VolumeButtons is available through [CocoaPods](https://cocoapods.org). To install
-it, simply add the following line to your Podfile:
-
-```ruby
-pod 'VolumeButtons'
-```
+- iOS 11 and newer.
+- RxSwift
 
 ## References
 
-This project based on Objective-C code [JPSVolumeButtonHandler](https://github.com/jpsim/JPSVolumeButtonHandler)  
+forked from [RedMadRobot/VolumeButtons](https://github.com/RedMadRobot/VolumeButtons)
